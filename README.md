@@ -1,4 +1,4 @@
-# analizeSpecifiedDirectory
+# Analyze Specified Directory
 Analyze specified directory with multithreading benchmark.
 
 Create the application that will analyze and show statistics of specified directory that will handle recursive directories.
