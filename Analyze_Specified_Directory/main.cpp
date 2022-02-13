@@ -1,13 +1,3 @@
-/*
-Create the application that will analyze and show statistics of specified directory that will handle recursive directories.
-It should print number of files and total number of lines (might as well count non-empty and empty lines).
-Provide unit tests for solutions.
-- Application should use multithreading(keep in mind system limitations, you might need to control number of concurrent calls, e.g., use thread pool).
-- Use std::filesystem
-- Use GTest for Unit Tests
-- As a bonus, you could also count words and letters and provide performance benchmarks(e.g., measure the impact of using the different number of threads).
-*/
-
 #include <atomic>      
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +5,7 @@ Provide unit tests for solutions.
 #include <filesystem>
 #include <functional>
 #include <future>
+#include <fstream>
 #include <iostream> 
 #include <memory>
 #include <mutex>
@@ -25,284 +16,147 @@ Provide unit tests for solutions.
 #include <utility>
 #include <vector>
 
-// Several global variables necessary for statistical calculations.
-unsigned int howManyDirectories = 0, howManyFiles = 0, howManyWords = 0, howManyLetters = 0;
-int isEmptyLine = 0, nonEmptyLine = 0;
+#include "Thread_Pool.hpp"
+#include "Synced_Stream.hpp"
 
-class threadPool
-{
-    typedef std::uint_fast32_t ui32;
-    typedef std::uint_fast64_t ui64;
+using std::cout;
+using std::endl;
 
-public:
-    // ============================
-    // Constructors and destructors
-    // ============================
+#define _WIN32
+#define _linux_
 
-    threadPool(const ui32& _thread_count = std::thread::hardware_concurrency())
-        : thread_count(_thread_count ? _thread_count : std::thread::hardware_concurrency()), threads(new std::thread[_thread_count ? _thread_count : std::thread::hardware_concurrency()])
-    {
-        create_threads();
-    }
-
-    ~threadPool()
-    {
-        wait_for_tasks();
-        running = false;
-        destroy_threads();
-    }
-
-    // =======================
-    // Public member functions
-    // =======================
-    ui64 get_tasks_queued() const
-    {
-        const std::scoped_lock lock(queue_mutex);
-        return tasks.size();
-    }
-
-    ui32 get_tasks_running() const
-    {
-        return tasks_total - (ui32)get_tasks_queued();
-    }
-
-    ui32 get_tasks_total() const
-    {
-        return tasks_total;
-    }
-
-    template <typename F>
-    void push_task(const F& task)
-    {
-        tasks_total++;
-        {
-            const std::scoped_lock lock(queue_mutex);
-            tasks.push(std::function<void()>(task));
-        }
-    }
-
-    template <typename F, typename... A>
-    void push_task(const F& task, const A &...args)
-    {
-        push_task([task, args...]
-            { task(args...); });
-    }
-
-    void reset(const ui32& _thread_count = std::thread::hardware_concurrency())
-    {
-        bool was_paused = paused;
-        paused = true;
-        wait_for_tasks();
-        running = false;
-        destroy_threads();
-        thread_count = _thread_count ? _thread_count : std::thread::hardware_concurrency();
-        threads.reset(new std::thread[thread_count]);
-        paused = was_paused;
-        running = true;
-        create_threads();
-    }
-
-    void wait_for_tasks()
-    {
-        while (true)
-        {
-            if (!paused)
-            {
-                if (tasks_total == 0)
-                    break;
-            }
-            else
-            {
-                if (get_tasks_running() == 0)
-                    break;
-            }
-            sleep_or_yield();
-        }
-    }
-
-    // ===========
-    // Public data
-    // ===========
-
-    std::atomic<bool> paused = false;
-    ui32 sleep_duration = 1000;
-
-private:
-    // ========================
-    // Private member functions
-    // ========================
-
-    void create_threads()
-    {
-        for (ui32 i = 0; i < thread_count; i++)
-        {
-            threads[i] = std::thread(&threadPool::worker, this);
-        }
-    }
-
-    void destroy_threads()
-    {
-        for (ui32 i = 0; i < thread_count; i++)
-        {
-            threads[i].join();
-        }
-    }
-
-    bool pop_task(std::function<void()>& task)
-    {
-        const std::scoped_lock lock(queue_mutex);
-        if (tasks.empty())
-            return false;
-        else
-        {
-            task = std::move(tasks.front());
-            tasks.pop();
-            return true;
-        }
-    }
-
-    void sleep_or_yield()
-    {
-        if (sleep_duration)
-            std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
-        else
-            std::this_thread::yield();
-    }
-
-    void worker()
-    {
-        while (running)
-        {
-            std::function<void()> task;
-            if (!paused && pop_task(task))
-            {
-                task();
-                tasks_total--;
-            }
-            else
-            {
-                sleep_or_yield();
-            }
-        }
-    }
-
-    // ============
-    // Private data
-    // ============
-
-    mutable std::mutex queue_mutex = {};
-    std::atomic<bool> running = true;
-    std::queue<std::function<void()>> tasks = {};
-    ui32 thread_count;
-    std::unique_ptr<std::thread[]> threads;
-    std::atomic<ui32> tasks_total = 0;
-};
-
-class syncedStream
-{
-public:
-    // =======================
-    // Public member functions
-    // =======================
-
-    syncedStream(std::ostream& _out_stream = std::cout)
-        : out_stream(_out_stream) {};
-
-    template <typename... T>
-    void print(const T &...items)
-    {
-        const std::scoped_lock lock(stream_mutex);
-        (out_stream << ... << items);
-    }
-
-    template <typename... T>
-    void println(const T &...items)
-    {
-        print(items..., '\n');
-    }
-
-private:
-    // ============
-    // Private data
-    // ============
-
-    mutable std::mutex stream_mutex = {};
-    std::ostream& out_stream;
+// Structure necessary for statistical calculations.
+struct counter {
+    int howManyDirectories;
+    int howManyFiles;
+    int emptyLines;
+    int nonEmptyLines;
+    int numWords;
+    int letters;
 };
 
 // Creating objects.
+threadPools pool(std::thread::hardware_concurrency());
 syncedStream sync_out;
-threadPool pool(std::thread::hardware_concurrency());
+counter count;
 
-// We list the catalog. Each subdirectory is treated as new work for the threading pool.
+// Function to calculate required counters such as number of words or letters
+void countStats(std::string path)
+{
+    std::ifstream inFile;
+    inFile.open(path);
+    if (inFile)
+    {
+        std::string line;
+
+        while (getline(inFile, line))
+        {
+            if (line.empty())
+            {
+                count.emptyLines++;
+            }
+            if (line.size() > 0)
+            {
+                count.nonEmptyLines++;
+            }
+
+            for (const auto& elem : line)
+            {
+                if ((elem >= 65 && elem <= 90) || (elem >= 97 && elem <= 122))
+                {
+                    count.letters++;
+                }
+            }
+            std::stringstream lineStream(line);
+            while (getline(lineStream, line, ' '))
+            {
+                count.numWords++;
+            }
+
+        }
+
+        inFile.close();
+    }
+    else
+    {
+        cout << "Wrong path given" << endl;
+    }
+}
+
+// Function to create task in each directory entry on the path specified by the user
 void listFilesWithThreads(std::string path)
 {
-    for (auto& dirEntry : std::filesystem::directory_iterator(path))
+    try
     {
-        if (!dirEntry.is_regular_file())
+        for (auto& dirEntry : std::filesystem::directory_iterator(path))
         {
-            sync_out.println("Directory: ", dirEntry.path());
-            howManyDirectories++;
-            if (std::filesystem::is_empty(dirEntry))
-                isEmptyLine++;
-            else
+            if (!dirEntry.is_regular_file())
             {
-                nonEmptyLine++;
+                sync_out.println("Directory: ", dirEntry.path());
+                count.howManyDirectories++;
+
                 std::string DirectoryName{ dirEntry.path().filename().string() };
+#ifdef _WIN32
                 pool.push_task(listFilesWithThreads, path + "/" + DirectoryName);
                 continue;
+#endif
+#ifdef _linux_
+                char sign = 92;
+                pool.push_task(listFilesWithThreads, path + sign + DirectoryName);
+                continue;
+#endif
+            }
+            if (dirEntry.is_regular_file())
+            {
+                std::filesystem::path file = dirEntry.path();
+                sync_out.println("Filename: ", file.filename(), " extension: ", file.extension());
+                count.howManyFiles++;
+                countStats(dirEntry.path().string());
             }
         }
-        howManyFiles++;
-        std::filesystem::path file = dirEntry.path();
-        std::string fileName{ file.filename().string() };
-        howManyLetters += fileName.size();
-        howManyWords++;
-        for (unsigned int i = 0; i < fileName.size(); i++)
-        {
-            if (fileName[i] == ' ')
-                howManyWords++;
-        }
-        sync_out.println("Filename: ", file.filename(), " extension: ", file.extension());
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    catch (...)
+    {
+        cout << "Don't type path to system directories." << endl;
+    }
+
 }
 
 // The statistics are divided by the total number of all threads.
 // This is necessary for the correct calculations of the runtime execution.
 void summary(std::vector<double> elapsedWithThreads, int maxThreads)
 {
-    std::cout << std::endl << std::endl << "|| SUMMARY ||" << std::endl << std::endl;
-    std::cout << "Numbers of directories: " << howManyDirectories / maxThreads << std::endl;
-    std::cout << "Numbers of files: " << howManyFiles / maxThreads << std::endl;
-    std::cout << "Numbers of non-empty lines: " << nonEmptyLine / maxThreads << std::endl;
-    std::cout << "Numbers of empty lines: " << isEmptyLine / maxThreads << std::endl << std::endl;
-    std::cout << "Letters in names of files: " << howManyLetters / maxThreads << std::endl;
-    std::cout << "Words in names of files: " << howManyWords / maxThreads << std::endl << std::endl;
+    cout << endl << endl << "|| SUMMARY ||" << endl << endl;
+    cout << "Numbers of directories:     " << count.howManyDirectories / maxThreads << endl;
+    cout << "Numbers of Files:           " << count.howManyFiles / maxThreads << endl;
+    cout << "Numbers of non-empty Lines: " << count.nonEmptyLines / maxThreads << endl;
+    cout << "Numbers of Empty Lines:     " << count.emptyLines / maxThreads << endl;
+    cout << "Number of Words:            " << count.numWords / maxThreads << endl;
+    cout << "Numbers of Letters:         " << count.letters / maxThreads << endl;
 
+    cout << endl << endl << "|| BENCHMARK ||" << endl << endl;
     for (int i = 0; i < maxThreads; i++)
     {
-        if (i >= 9) std::cout << "Elapsed time listing with using " << i + 1 << " threads: " << std::setw(14) << std::fixed << elapsedWithThreads[i] << std::endl;
-        else if (i > 0) std::cout << "Elapsed time listing with using " << i + 1 << " threads: " << std::setw(15) << std::fixed << elapsedWithThreads[i] << std::endl;
-        else std::cout << "Elapsed time listing with using " << i + 1 << " thread: " << std::setw(16) << std::fixed << elapsedWithThreads[i] << std::endl;
+        if (i >= 9) cout << "Elapsed time listing with using " << i + 1 << " threads: " << std::setw(14) << std::fixed << elapsedWithThreads[i] << std::endl;
+        else if (i > 0) cout << "Elapsed time listing with using " << i + 1 << " threads: " << std::setw(15) << std::fixed << elapsedWithThreads[i] << std::endl;
+        else cout << "Elapsed time listing with using " << i + 1 << " thread: " << std::setw(16) << std::fixed << elapsedWithThreads[i] << std::endl;
     }
 }
 
 int main()
 {
-    // Maximum number of threads handled by the processor.
     int maxThreads = std::thread::hardware_concurrency();
     std::string path;
     std::vector<double> elapsedWithThreads;
 
-    std::cout << "|| ANALIZE SPECIFIED DIRECTORY ||" << std::endl << std::endl;
-    std::cout << "Don't try to analyze local drives or system folders!" << std::endl;
-    std::cout << "Enter the path to be analyzed:" << std::endl;
+    cout << "|| ANALIZE SPECIFIED DIRECTORY ||" << endl << endl;
+    cout << "Don't type path to system directories." << endl;
+    cout << "Enter the path to be analyzed:" << endl;
     std::cin >> path;
 
     while (!std::filesystem::exists(path))
     {
-        std::cout << std::endl << "The path is incorrect! Try again:" << std::endl;
+        cout << endl << "The path is incorrect! Try again:" << endl;
         std::cin >> path;
     }
 
@@ -316,7 +170,10 @@ int main()
         double elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count() * 1e-9;
         elapsedWithThreads.push_back(elapsed);
     }
+
     summary(elapsedWithThreads, maxThreads);
     system("pause");
+
     return 0;
+
 }
